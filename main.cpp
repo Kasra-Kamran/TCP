@@ -18,12 +18,29 @@
 #define INTERFACE "wlp3s0"
 #define BUF_SIZE 256
 
-class TcpSocket
+
+void printHex(const void *ptr, size_t size)
+{
+    const unsigned char *bytePtr = (const unsigned char*)ptr;
+    
+    printf("Hexadecimal representation:\n");
+    for (size_t i = 0; i < size; ++i)
+    {
+        if(i % 4 == 0)
+            printf("\n");
+        printf("%02X ", bytePtr[i]);
+    }
+    printf("\n");
+}
+
+
+class TcpListener
 {
 public:
-    TcpSocket(std::string_view)
+    TcpListener(const std::string& address, int port)
     {
         _rawfd = socket(AF_PACKET, SOCK_RAW, ETH_P_IP);
+        std::cout << "rawfd: " << _rawfd << "\n";
         getMacAddress(INTERFACE, _srcMAC);
 
         struct sockaddr_ll socket_address;
@@ -34,7 +51,12 @@ public:
         socket_address.sll_pkttype = PACKET_OTHERHOST;
         socket_address.sll_halen = 6;
         memcpy(socket_address.sll_addr, _srcMAC, 6);
-        bind(_rawfd, (struct sockaddr*)&socket_address, sizeof(socket_address));
+        int res = bind(_rawfd, (struct sockaddr*)&socket_address, sizeof(socket_address));
+        std::cout << "bind res: " << res << "\n";
+
+        inet_pton(AF_INET, address.c_str(), _IPHeader.DestinationIP);
+        _TCPHeader.DestinationPort = htons(port);
+        _TCPHeader.SourcePort = htons(getDynamicSourcePort((char*)&_IPHeader.DestinationIP[0], _TCPHeader.DestinationPort));
     }
 
     void Send(void* data, size_t size)
@@ -46,10 +68,28 @@ public:
             _IPHeader.TOS = 0;
             _IPHeader.Version = 0b0100;
             _IPHeader.IHL = 0b0101;
-
+            _IPHeader.Identification = _IPHeader.Checksum; // Do this better.
+            _IPHeader.Flags = 0b010;
+            _IPHeader.FragmentOffset = 0;
+            _IPHeader.TTL = 64;
+            _IPHeader.Protocol = 0x06;
+            _IPHeader.Checksum = 0;
             _TCPHeader.SequenceNumber++;
+            _TCPHeader.AcknowledmentNumber = htons(getACKnumber());
+            _TCPHeader.DataOffset = 0b0101;
+            _TCPHeader.Flags = 0b000000010; // actually do this
+            _TCPHeader.WindowSize = 0xFFFF;
+            _TCPHeader.Checksum = 0;
+            _TCPHeader.UrgentPointer = 0;
             calculateIPchecksum();
             calculateTCPchecksum();
+
+            unsigned char packet[sizeof(EthernetHeader) + sizeof(IPHeader) + sizeof(TCPHeader) + s.Size];
+            memcpy((void*)packet, (void*)&_EthernetHeader, sizeof(EthernetHeader));
+            memcpy((void*)(packet + sizeof(EthernetHeader)), (void*)&_IPHeader, sizeof(IPHeader));
+            memcpy((void*)(packet + sizeof(EthernetHeader) + sizeof(IPHeader)), (void*)&_TCPHeader, sizeof(TCPHeader));
+            memcpy((void*)(packet + sizeof(EthernetHeader) + sizeof(IPHeader) + sizeof(TCPHeader)), s.Data, s.Size);
+            send((void*)packet, sizeof(packet));
         }
     }
 
@@ -67,6 +107,7 @@ public:
             if(buffer[12] == 0x08 && buffer[13] == 0x06 && strcmp((char*)&buffer[38], (char*)_privateIP))
             {
                 memcpy((void*)_destMAC, (void*)(buffer + 22), 6);
+                memcpy((void*)_EthernetHeader.DestinationMAC, (void*)(buffer + 22), 6);
                 return;
             }
                 
@@ -85,6 +126,19 @@ private:
             uint16_t Protocol;
         };
     } _EthernetHeader;
+
+    struct ARPHeader
+    {
+        uint16_t HardwareType;
+        uint16_t ProtocolType;
+        uint8_t HardwareAddressLength;
+        uint8_t ProtocolAddressLength;
+        uint16_t Operation;
+        unsigned char SourceMAC[6];
+        unsigned char SourceIP[4];
+        unsigned char DestinationMAC[6];
+        unsigned char DestinationIP[4];
+    } _ARPHeader;
 
     struct IPHeader
     {
@@ -148,7 +202,6 @@ public:
     {
         uint32_t sum = 0;
 
-        // Sum up 16-bit words
         while (len > 1)
         {
             sum += *((uint16_t*)data);
@@ -156,19 +209,16 @@ public:
             len -= 2;
         }
 
-        // If there's a remaining byte
         if (len == 1)
         {
             sum += *((uint8_t*)data);
         }
 
-        // Fold 32-bit sum to 16 bits
         while (sum >> 16)
         {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }
 
-        // Take one's complement
         return ~sum;
     }
 
@@ -207,39 +257,41 @@ public:
 
     void constructARPrequest()
     {
-        unsigned char arp[] = {0x08, 0x06};
-        constructEthernetHeader(arp);
-        memcpy((void*)_packet, (void*)&_EthernetHeader, 14);
-        memset((void*)_packet, 0xFF, 6);
-        unsigned char ARPdata[] = 
-        {
-            0x00, 0x01,    // Hardware Type: Ethernet (1)
-            0x08, 0x00,    // Protocol Type: IPv4 (0x0800)
-            0x06,          // Hardware Address Length: 6 (Ethernet MAC address length)
-            0x04,          // Protocol Address Length: 4 (IPv4 address length)
-            0x00, 0x01     // Operation: ARP Request (1)
-        };
-        memcpy((void*)(_packet + 14), (void*)ARPdata, 8);
-        memcpy((void*)(_packet + 22), (void*)(_packet + 6), 6);
-        unsigned char local_ip[] = {0xC0, 0xA8, 0x2B, 0x59};
-        memcpy((void*)(_packet + 28), (void*)local_ip, 4);
-        // memcpy((void*)(_packet + 28), (void*)get_internal_private_ip_address(), 4);
-        memset((void*)(_packet + 32), 0x00, 6);
-        unsigned char default_gateway[] = {0xC0, 0xA8, 0x2B, 0x01};
-        memcpy((void*)(_packet + 38), default_gateway, 4);
-        // memcpy((void*)(_packet + 38), (void*)get_default_gateway(), 4);
-        send((void*)_packet, 42);
+        printHex((void*)_srcMAC, 6);
+        memcpy((void*)_EthernetHeader.DestinationMAC, (void*)_destMAC, 6);
+        memcpy((void*)&_EthernetHeader.SourceMAC, (void*)_srcMAC, 6);
+        printHex((void*)&_EthernetHeader.SourceMAC, 6);
+        _EthernetHeader.Protocol = htons(0x0806);
+        _ARPHeader.HardwareType = htons(0x0001);
+        _ARPHeader.ProtocolType = htons(0x0800);
+        _ARPHeader.HardwareAddressLength = 0X06;
+        _ARPHeader.ProtocolAddressLength = 0x04;
+        _ARPHeader.Operation = htons(0x0001);
+        memcpy((void*)_ARPHeader.SourceMAC, (void*)_EthernetHeader.SourceMAC, 6);
+        memset((void*)_EthernetHeader.DestinationMAC, 0xFF, 6);
+
+        _ARPHeader.SourceIP[0] = 0xC0;
+        _ARPHeader.SourceIP[1] = 0xA8;
+        _ARPHeader.SourceIP[2] = 0x2B;
+        _ARPHeader.SourceIP[3] = 0x59;
+        _ARPHeader.DestinationIP[0] = 0xC0;
+        _ARPHeader.DestinationIP[1] = 0xA8;
+        _ARPHeader.DestinationIP[2] = 0x2B;
+        _ARPHeader.DestinationIP[3] = 0x01;
+
+        unsigned char packet[sizeof(EthernetHeader) + sizeof(ARPHeader)];
+        memcpy((void*)packet, (void*)&_EthernetHeader, sizeof(EthernetHeader));
+        memcpy((void*)(packet + sizeof(EthernetHeader)), (void*)&_ARPHeader, sizeof(ARPHeader));
+        printHex((void*)packet, sizeof(packet));
+        send((void*)packet, sizeof(EthernetHeader) + sizeof(ARPHeader));
         recv();
-        arp[0] = 0x08;
-        arp[1] = 0x00;
-        constructEthernetHeader(arp);
-        memcpy((void*)_packet, (void*)&_EthernetHeader, 14);
+        _EthernetHeader.Protocol = htons(0x0800);
     }
 
     void constructEthernetHeader(unsigned char protocol[])
     {
         memcpy((void*)_EthernetHeader.DestinationMAC, (void*)_destMAC, 6);
-        memcpy((void*)&_EthernetHeader, (void*)_srcMAC, 6);
+        memcpy((void*)&_EthernetHeader.SourceMAC, (void*)_srcMAC, 6);
         _EthernetHeader.Protocol = *(uint16_t*)protocol;
     }
 
@@ -261,16 +313,61 @@ public:
 
         ipv4_header[3] = static_cast<uint8_t>(ipv4_header[3]) + static_cast<uint8_t>(size);
 
-        // Calculate checksum over the header
         uint16_t checksum = calculateChecksum(ipv4_header, sizeof(ipv4_header));
 
-        // Update the checksum field in the header
-        ipv4_header[11] = checksum >> 8;    // Most significant byte
-        ipv4_header[10] = checksum & 0xFF;  // Least significant byte
+        ipv4_header[11] = checksum >> 8;
+        ipv4_header[10] = checksum & 0xFF;
 
         memcpy((void*)(_packet + 14), (void*)ipv4_header, 20);
         memcpy((void*)(_packet + 34), (void*)TCPheader, size);
         send((void*)_packet, 34 + size);
+    }
+
+    int getDynamicSourcePort(const char* destination_ip, int destination_port)
+    {
+        return 45678;
+
+        int sockfd;
+        struct sockaddr_in dest_addr, local_addr;
+        socklen_t addrlen = sizeof(local_addr);
+
+        // Create a TCP socket
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd == -1) {
+            perror("socket");
+            return -1;
+        }
+
+        // Specify the destination IP address and port
+        memset(&dest_addr, 0, sizeof(dest_addr));
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_addr.s_addr = inet_addr(destination_ip);
+        dest_addr.sin_port = htons(destination_port);
+
+        // Connect to the destination
+        if (connect(sockfd, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) == -1) {
+            perror("connect");
+            close(sockfd);
+            return -1;
+        }
+
+        // Get the local port assigned to the socket
+        if (getsockname(sockfd, (struct sockaddr *)&local_addr, &addrlen) == -1) {
+            perror("getsockname");
+            close(sockfd);
+            return -1;
+        }
+
+        close(sockfd);
+
+        int port = ntohs(local_addr.sin_port);
+
+        return port;
+    }
+
+    int getACKnumber()
+    {
+        return 0;
     }
 
     void constructTCPheader()
@@ -310,8 +407,8 @@ public:
 
         delete[] to_check;
 
-        header[16] = checksum & 0xFF;  // Least significant byte
-        header[17] = checksum >> 8;    // Most significant byte
+        header[16] = checksum & 0xFF;
+        header[17] = checksum >> 8;
 
         unsigned char tcp_header[] =
         {
@@ -339,27 +436,22 @@ public:
         struct ifreq ifr;
         int sockfd;
 
-        // Create a socket
         sockfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (sockfd == -1) {
             perror("socket");
             return -1;
         }
 
-        // Set the interface name in the ifreq structure
         strncpy(ifr.ifr_name, interface, IFNAMSIZ);
 
-        // Get the MAC address using ioctl
         if (ioctl(sockfd, SIOCGIFHWADDR, &ifr) == -1) {
             perror("ioctl");
             close(sockfd);
             return -1;
         }
 
-        // Copy the MAC address from ifr to the provided buffer
         memcpy(macAddress, ifr.ifr_hwaddr.sa_data, 6);
 
-        // Close the socket
         close(sockfd);
 
         return 0;
@@ -378,7 +470,9 @@ public:
 
 int main()
 {
-    TcpSocket t(std::string("hello"));
+    TcpListener t("216.239.38.120", 443);
     t.constructARPrequest();
-    t.constructTCPheader();
+    // t.constructTCPheader();
+    int a = 5;
+    t.Send((void*)&a, 4);
 }
