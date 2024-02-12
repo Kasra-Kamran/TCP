@@ -1,0 +1,3 @@
+This is an implementataion of the tcp protocol, for learning purposes.
+
+I'm still working on it...
