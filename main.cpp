@@ -19,16 +19,35 @@
 #define BUF_SIZE 256
 
 
-void printHex(const void *ptr, size_t size)
+void printHex(void *ptr, size_t size)
 {
-    const unsigned char *bytePtr = (const unsigned char*)ptr;
+    unsigned char bytePtr[size];
+    memcpy((void*)bytePtr, ptr, size); 
     
     printf("Hexadecimal representation:\n");
     for (size_t i = 0; i < size; ++i)
     {
         if(i % 4 == 0)
             printf("\n");
+        int n = *(uint8_t*)&bytePtr[i];
+        for(int i = 0; i < 8; i++)
+        {
+            if (n & 0b10000000)
+                printf("1");
+            else
+                printf("0");
+
+            n <<= 1;
+        }
+        printf(" ");
+    }
+    printf("\n");
+    for (size_t i = 0; i < size; ++i)
+    {
+        if(i % 4 == 0)
+            printf("\n");
         printf("%02X ", bytePtr[i]);
+        printf(" ");
     }
     printf("\n");
 }
@@ -40,7 +59,6 @@ public:
     TcpListener(const std::string& address, int port)
     {
         _rawfd = socket(AF_PACKET, SOCK_RAW, ETH_P_IP);
-        std::cout << "rawfd: " << _rawfd << "\n";
         getMacAddress(INTERFACE, _srcMAC);
 
         struct sockaddr_ll socket_address;
@@ -52,9 +70,9 @@ public:
         socket_address.sll_halen = 6;
         memcpy(socket_address.sll_addr, _srcMAC, 6);
         int res = bind(_rawfd, (struct sockaddr*)&socket_address, sizeof(socket_address));
-        std::cout << "bind res: " << res << "\n";
 
         inet_pton(AF_INET, address.c_str(), _IPHeader.DestinationIP);
+        inet_pton(AF_INET, "192.168.43.89", _IPHeader.SourceIP);
         _TCPHeader.DestinationPort = htons(port);
         _TCPHeader.SourcePort = htons(getDynamicSourcePort((char*)&_IPHeader.DestinationIP[0], _TCPHeader.DestinationPort));
     }
@@ -66,23 +84,33 @@ public:
         {
             _IPHeader.TotalLength = htons(sizeof(IPHeader) + sizeof(TCPHeader) + s.Size);
             _IPHeader.TOS = 0;
-            _IPHeader.Version = 0b0100;
-            _IPHeader.IHL = 0b0101;
+            _IPHeader.Version = 0b0101; // reversed
+            _IPHeader.IHL = 0b0100;
             _IPHeader.Identification = _IPHeader.Checksum; // Do this better.
-            _IPHeader.Flags = 0b010;
-            _IPHeader.FragmentOffset = 0;
+            _IPHeader.Flags_FragmentOffset = 0;
+            *(uint8_t*)&_IPHeader.Flags_FragmentOffset |= 0b010 << 5;
+            *(uint8_t*)&_IPHeader.Flags_FragmentOffset &= 0b11100000;
+            *((uint8_t*)&_IPHeader.Flags_FragmentOffset + 1) = 0;
             _IPHeader.TTL = 64;
             _IPHeader.Protocol = 0x06;
             _IPHeader.Checksum = 0;
-            _TCPHeader.SequenceNumber++;
+            memcpy((void*)_TCPPseudoHeader.SourceIP, (void*)_IPHeader.SourceIP, 6);
+            memcpy((void*)_TCPPseudoHeader.DestinationIP, (void*)_IPHeader.DestinationIP, 6);
+            _TCPPseudoHeader.Protocol = htons(6);
+            _TCPPseudoHeader.TCPSegmentLength = htons(sizeof(TCPHeader) + s.Size);
+            // _TCPHeader.SequenceNumber = htons(_TCPHeader.SequenceNumber + 1);
+            _TCPHeader.SequenceNumber &= 0;
+            _TCPHeader.SequenceNumber = htonl(1);
             _TCPHeader.AcknowledmentNumber = htons(getACKnumber());
-            _TCPHeader.DataOffset = 0b0101;
-            _TCPHeader.Flags = 0b000000010; // actually do this
+            _TCPHeader.DataOffset_Flags = 0x0000;
+            *(uint8_t*)&_TCPHeader.DataOffset_Flags |= 5 << 4;
+            // *(uint8_t*)&_TCPHeader.DataOffset_Flags &= 0b0;
+            *((uint8_t*)&_TCPHeader.DataOffset_Flags + 1) = 0b00001010;
             _TCPHeader.WindowSize = 0xFFFF;
             _TCPHeader.Checksum = 0;
             _TCPHeader.UrgentPointer = 0;
             calculateIPchecksum();
-            calculateTCPchecksum();
+            calculateTCPchecksum(s);
 
             unsigned char packet[sizeof(EthernetHeader) + sizeof(IPHeader) + sizeof(TCPHeader) + s.Size];
             memcpy((void*)packet, (void*)&_EthernetHeader, sizeof(EthernetHeader));
@@ -96,6 +124,7 @@ public:
     void send(void* data, size_t size)
     {
         size_t sent = ::send(_rawfd, data, size, 0);
+        std::cout << sent << "\n";
     }
 
     void recv()
@@ -147,8 +176,7 @@ private:
         uint8_t TOS;
         uint16_t TotalLength;
         uint16_t Identification;
-        uint16_t Flags : 3;
-        uint16_t FragmentOffset : 13;
+        uint16_t Flags_FragmentOffset = 0;
         uint8_t TTL;
         uint8_t Protocol;
         uint16_t Checksum;
@@ -162,7 +190,7 @@ private:
         unsigned char SourceIP[4];
         unsigned char DestinationIP[4];
         uint16_t Protocol;
-        uint16_t TCPHeaderLength;
+        uint16_t TCPSegmentLength;
     } _TCPPseudoHeader;
 
     struct TCPHeader
@@ -171,9 +199,7 @@ private:
         uint16_t DestinationPort;
         uint32_t SequenceNumber;
         uint32_t AcknowledmentNumber;
-        uint16_t DataOffset : 4;
-        uint16_t : 3;
-        uint16_t Flags : 9;
+        uint16_t DataOffset_Flags;
         uint16_t WindowSize;
         uint16_t Checksum;
         uint16_t UrgentPointer;
@@ -235,11 +261,12 @@ public:
         }
     }
 
-    void calculateTCPchecksum()
+    void calculateTCPchecksum(Segment& s)
     {
-        uint32_t sum;
+        uint32_t sum = 0;
         sumBytes((unsigned char*)&_TCPPseudoHeader, sizeof(TCPPseudoHeader), sum);
         sumBytes((unsigned char*)&_TCPHeader, sizeof(TCPHeader), sum);
+        sumBytes((unsigned char*)s.Data, s.Size, sum);
 
         while (sum >> 16)
         {
@@ -247,20 +274,18 @@ public:
         }
 
         sum = ~sum;
-        _TCPHeader.Checksum = htons(sum);
+        _TCPHeader.Checksum = (sum);
     }
 
     void calculateIPchecksum()
     {
-        _IPHeader.Checksum = htons(calculateChecksum((unsigned char*)&_IPHeader, sizeof(IPHeader)));
+        _IPHeader.Checksum = calculateChecksum((unsigned char*)&_IPHeader, sizeof(IPHeader));
     }
 
     void constructARPrequest()
     {
-        printHex((void*)_srcMAC, 6);
         memcpy((void*)_EthernetHeader.DestinationMAC, (void*)_destMAC, 6);
         memcpy((void*)&_EthernetHeader.SourceMAC, (void*)_srcMAC, 6);
-        printHex((void*)&_EthernetHeader.SourceMAC, 6);
         _EthernetHeader.Protocol = htons(0x0806);
         _ARPHeader.HardwareType = htons(0x0001);
         _ARPHeader.ProtocolType = htons(0x0800);
@@ -282,7 +307,6 @@ public:
         unsigned char packet[sizeof(EthernetHeader) + sizeof(ARPHeader)];
         memcpy((void*)packet, (void*)&_EthernetHeader, sizeof(EthernetHeader));
         memcpy((void*)(packet + sizeof(EthernetHeader)), (void*)&_ARPHeader, sizeof(ARPHeader));
-        printHex((void*)packet, sizeof(packet));
         send((void*)packet, sizeof(EthernetHeader) + sizeof(ARPHeader));
         recv();
         _EthernetHeader.Protocol = htons(0x0800);
@@ -472,7 +496,6 @@ int main()
 {
     TcpListener t("216.239.38.120", 443);
     t.constructARPrequest();
-    // t.constructTCPheader();
-    int a = 5;
+    int a = 0;
     t.Send((void*)&a, 4);
 }
